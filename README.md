@@ -2,8 +2,6 @@
 
 A mobile-friendly web app that predicts golf scores using machine learning and provides personalized insights.
 
-**Built for Dad with ❤️**
-
 ---
 
 ## 📱 What This App Does
@@ -262,10 +260,6 @@ If something breaks or you need help:
 4. Message the Streamlit community: https://discuss.streamlit.io/
 
 ---
-
-## ❤️ Credits
-
-Built by a loving son for his dad.
 
 Uses:
 - Streamlit (for the web app)
