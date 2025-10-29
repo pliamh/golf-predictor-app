@@ -1,0 +1,450 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import pickle
+import os
+from openai import OpenAI
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error
+
+# Page config - mobile friendly
+st.set_page_config(
+    page_title="⛳ Golf Score Predictor",
+    page_icon="⛳",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
+
+# Custom CSS for mobile-friendly design
+st.markdown("""
+<style>
+    .main {
+        padding: 1rem;
+    }
+    .stButton>button {
+        width: 100%;
+        height: 3rem;
+        font-size: 1.2rem;
+        font-weight: bold;
+    }
+    .prediction-box {
+        background-color: #e8f5e9;
+        padding: 2rem;
+        border-radius: 10px;
+        border: 3px solid #4caf50;
+        text-align: center;
+        margin: 1rem 0;
+    }
+    .prediction-score {
+        font-size: 3rem;
+        color: #1b5e20;
+        font-weight: bold;
+    }
+    h1 {
+        text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Initialize OpenAI client
+@st.cache_resource
+def get_openai_client():
+    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+    if not api_key:
+        st.error("⚠️ OpenAI API key not configured. Please add it to Streamlit secrets.")
+        st.stop()
+    return OpenAI(api_key=api_key)
+
+client = get_openai_client()
+
+# File paths
+MODEL_FILE = "golf_model.pkl"
+HISTORY_FILE = "golf_history.csv"
+NEW_ROUNDS_FILE = "new_rounds.csv"
+
+# Initialize historical data
+def initialize_data():
+    """Initialize with historical GHIN data if files don't exist"""
+    if not os.path.exists(HISTORY_FILE):
+        # Historical GHIN data
+        ghin_data = {
+            'date': ['2025-10-22', '2025-10-19', '2025-10-17', '2025-10-13', '2025-10-10',
+                     '2025-10-08', '2025-10-06', '2025-10-03', '2025-09-29', '2025-09-22',
+                     '2025-09-21', '2025-09-20', '2025-09-19', '2025-09-15', '2025-09-14',
+                     '2025-09-13', '2025-09-12', '2025-09-08', '2025-09-03', '2025-08-19',
+                     '2025-08-18', '2025-08-16', '2025-08-15', '2025-07-08', '2025-06-30',
+                     '2025-06-29', '2025-06-23', '2025-06-20', '2025-06-18', '2025-06-17',
+                     '2025-06-17', '2025-06-16', '2025-06-15', '2025-06-14', '2025-06-13',
+                     '2025-06-11', '2025-06-08', '2025-06-07', '2025-06-06', '2025-06-05',
+                     '2025-06-02', '2025-06-01', '2025-05-30', '2025-05-27', '2025-05-25',
+                     '2025-05-24', '2025-05-20', '2025-05-17', '2025-05-16', '2025-05-13'],
+            'score': [103, 107, 102, 103, 102, 95, 102, 102, 102, 92,
+                      95, 98, 96, 102, 95, 99, 92, 102, 95, 104,
+                      98, 103, 102, 90, 93, 88, 105, 93, 92, 97,
+                      97, 97, 98, 103, 107, 90, 95, 95, 102, 95,
+                      105, 96, 103, 96, 99, 89, 95, 97, 101, 112]
+        }
+        
+        df = pd.DataFrame(ghin_data)
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Add basic features
+        df['course_rating'] = 67.9
+        df['slope'] = 120
+        df['is_home_course'] = 1
+        df['month'] = df['date'].dt.month
+        df['day_of_week'] = df['date'].dt.dayofweek
+        df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
+        df['pcc'] = 0
+        
+        # Temperature estimates by month
+        temp_map = {5: 82, 6: 86, 7: 88, 8: 88, 9: 87, 10: 83}
+        df['temp_mean'] = df['month'].map(temp_map)
+        df['precipitation'] = 0
+        df['wind_speed_max'] = 10
+        df['is_hot'] = (df['temp_mean'] > 85).astype(int)
+        df['is_windy'] = 0
+        df['has_rain'] = 0
+        df['difficulty_vs_home'] = 0
+        
+        # Rolling stats
+        df = df.sort_values('date')
+        df['days_since_last_round'] = df['date'].diff().dt.days.fillna(7)
+        df['rolling_avg_5'] = df['score'].rolling(window=5, min_periods=1).mean()
+        df['rolling_std_5'] = df['score'].rolling(window=5, min_periods=1).std().fillna(0)
+        
+        # Default qualitative features
+        df['practice_score'] = 0
+        df['greens_numeric'] = 1
+        df['rough_numeric'] = 1
+        df['has_construction'] = 0
+        df['has_standing_water'] = 0
+        df['time_numeric'] = 0
+        df['num_partners'] = 3
+        df['physical_condition'] = 7
+        
+        df.to_csv(HISTORY_FILE, index=False)
+        
+        # Train initial model
+        train_model(df)
+    
+    # Initialize new rounds file
+    if not os.path.exists(NEW_ROUNDS_FILE):
+        pd.DataFrame().to_csv(NEW_ROUNDS_FILE, index=False)
+
+def train_model(df):
+    """Train the XGBoost model"""
+    features = [
+        'course_rating', 'slope', 'is_home_course', 'month', 'day_of_week', 'is_weekend',
+        'days_since_last_round', 'rolling_avg_5', 'rolling_std_5',
+        'temp_mean', 'precipitation', 'wind_speed_max', 'is_hot', 'is_windy', 'has_rain',
+        'difficulty_vs_home', 'pcc',
+        'practice_score', 'greens_numeric', 'rough_numeric',
+        'has_construction', 'has_standing_water', 'time_numeric',
+        'num_partners', 'physical_condition'
+    ]
+    
+    X = df[features]
+    y = df['score']
+    
+    model = xgb.XGBRegressor(n_estimators=150, max_depth=4, learning_rate=0.1, random_state=42)
+    model.fit(X, y)
+    
+    with open(MODEL_FILE, 'wb') as f:
+        pickle.dump(model, f)
+    
+    return model
+
+@st.cache_resource
+def load_model():
+    """Load the trained model"""
+    if os.path.exists(MODEL_FILE):
+        with open(MODEL_FILE, 'rb') as f:
+            return pickle.load(f)
+    return None
+
+def get_weather_forecast():
+    """Get simple weather estimate for Naples, FL"""
+    month = datetime.now().month
+    temp_map = {
+        1: 68, 2: 70, 3: 74, 4: 78, 5: 82, 6: 86,
+        7: 88, 8: 88, 9: 87, 10: 83, 11: 76, 12: 70
+    }
+    temp = temp_map.get(month, 80)
+    return {
+        'temp_mean': temp,
+        'precipitation': 0,
+        'wind_speed_max': 10
+    }
+
+def make_prediction(inputs):
+    """Make a score prediction"""
+    model = load_model()
+    if model is None:
+        st.error("Model not found. Initializing...")
+        return None
+    
+    # Load history for rolling stats
+    df_history = pd.read_csv(HISTORY_FILE)
+    df_history['date'] = pd.to_datetime(df_history['date'])
+    
+    # Calculate recent form
+    recent_scores = df_history.tail(5)['score']
+    rolling_avg = recent_scores.mean()
+    rolling_std = recent_scores.std() if len(recent_scores) > 1 else 0
+    
+    # Days since last round
+    last_date = df_history['date'].max()
+    days_since = (datetime.now() - last_date).days
+    
+    # Get weather
+    weather = get_weather_forecast()
+    
+    # Build feature dict
+    features = {
+        'course_rating': 67.9 - (inputs['tee_box'] - 4) * 0.3,
+        'slope': 120 - (inputs['tee_box'] - 4) * 2,
+        'is_home_course': 1,
+        'month': datetime.now().month,
+        'day_of_week': datetime.now().weekday(),
+        'is_weekend': 1 if datetime.now().weekday() >= 5 else 0,
+        'days_since_last_round': days_since,
+        'rolling_avg_5': rolling_avg,
+        'rolling_std_5': rolling_std,
+        'temp_mean': weather['temp_mean'],
+        'precipitation': weather['precipitation'],
+        'wind_speed_max': weather['wind_speed_max'],
+        'is_hot': 1 if weather['temp_mean'] > 85 else 0,
+        'is_windy': 1 if weather['wind_speed_max'] > 15 else 0,
+        'has_rain': 1 if weather['precipitation'] > 0 else 0,
+        'difficulty_vs_home': (120 - (inputs['tee_box'] - 4) * 2) - 120,
+        'pcc': 0,
+        'practice_score': inputs['practice_score'],
+        'greens_numeric': inputs['greens_numeric'],
+        'rough_numeric': inputs['rough_numeric'],
+        'has_construction': inputs['has_construction'],
+        'has_standing_water': inputs['has_standing_water'],
+        'time_numeric': inputs['time_numeric'],
+        'num_partners': inputs['num_partners'],
+        'physical_condition': inputs['physical_condition']
+    }
+    
+    X = pd.DataFrame([features])
+    prediction = model.predict(X)[0]
+    
+    return prediction, features, weather
+
+# Initialize data on first run
+initialize_data()
+
+# App title
+st.title("⛳ Golf Score Predictor")
+st.markdown("### Predict your score at Naples Lakes")
+
+# Create tabs
+tab1, tab2, tab3 = st.tabs(["🎯 Predict Score", "📝 Enter Actual Score", "📊 Stats"])
+
+# TAB 1: Predict Score
+with tab1:
+    st.markdown("#### Today's Round")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        tee_box = st.selectbox("Tee Box", options=[1, 2, 3, 4, 5, 6], index=3, 
+                               help="1 = hardest, 6 = easiest")
+        
+        practiced = st.selectbox("Practiced Today?", 
+                                 options=["No", "Driving Range", "Putting Green", "Both"])
+        
+        greens_speed = st.selectbox("Greens Speed", 
+                                    options=["Slow", "Medium", "Fast"], index=1)
+        
+        rough_thickness = st.selectbox("Rough Thickness", 
+                                       options=["Thin", "Normal", "Thick"], index=1)
+    
+    with col2:
+        physical_condition = st.slider("Physical Condition", 1, 10, 7,
+                                      help="How do you feel today?")
+        
+        time_of_day = st.selectbox("Time of Day", 
+                                   options=["Morning", "Afternoon", "Evening"], index=0)
+        
+        num_partners = st.number_input("Number of Playing Partners", 0, 5, 3)
+        
+        construction = st.checkbox("Construction areas on course?")
+        
+    standing_water = st.checkbox("Temporary standing water on course?")
+    
+    if st.button("🎯 PREDICT MY SCORE", type="primary"):
+        # Map inputs
+        practice_map = {"No": 0, "Driving Range": 1, "Putting Green": 1, "Both": 2}
+        greens_map = {"Slow": 0, "Medium": 1, "Fast": 2}
+        rough_map = {"Thin": 0, "Normal": 1, "Thick": 2}
+        time_map = {"Morning": 0, "Afternoon": 1, "Evening": 2}
+        
+        inputs = {
+            'tee_box': tee_box,
+            'practice_score': practice_map[practiced],
+            'greens_numeric': greens_map[greens_speed],
+            'rough_numeric': rough_map[rough_thickness],
+            'has_construction': 1 if construction else 0,
+            'has_standing_water': 1 if standing_water else 0,
+            'time_numeric': time_map[time_of_day],
+            'num_partners': num_partners,
+            'physical_condition': physical_condition
+        }
+        
+        prediction, features, weather = make_prediction(inputs)
+        
+        if prediction:
+            # Store in session state
+            st.session_state['last_prediction'] = {
+                'score': prediction,
+                'date': datetime.now().strftime('%Y-%m-%d'),
+                'inputs': inputs,
+                'features': features,
+                'weather': weather
+            }
+            
+            # Display prediction
+            st.markdown(f"""
+            <div class="prediction-box">
+                <h2>🏌️ Predicted Score</h2>
+                <div class="prediction-score">{prediction:.0f}</div>
+                <p style="font-size: 1.1rem; color: #555;">Expected range: {prediction-3:.0f} - {prediction+3:.0f}</p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Show conditions
+            st.markdown("#### 📊 Today's Conditions")
+            st.write(f"🌡️ Temperature: {weather['temp_mean']:.0f}°F")
+            st.write(f"💨 Wind: {weather['wind_speed_max']:.0f} mph")
+            st.write(f"🏌️ Tee Box: {tee_box}")
+            st.write(f"💪 Physical Condition: {physical_condition}/10")
+            
+            st.success("✅ Prediction saved! Enter your actual score after the round in the next tab.")
+
+# TAB 2: Enter Actual Score
+with tab2:
+    st.markdown("#### After Your Round")
+    
+    if 'last_prediction' not in st.session_state:
+        st.info("👈 Make a prediction first in the 'Predict Score' tab!")
+    else:
+        pred = st.session_state['last_prediction']
+        
+        st.markdown(f"**Predicted Score:** {pred['score']:.0f}")
+        st.markdown(f"**Date:** {pred['date']}")
+        
+        actual_score = st.number_input("Your Actual Score", 70, 130, int(pred['score']))
+        
+        if st.button("💾 SAVE SCORE", type="primary"):
+            # Load new rounds
+            try:
+                new_rounds = pd.read_csv(NEW_ROUNDS_FILE)
+            except:
+                new_rounds = pd.DataFrame()
+            
+            # Create new round entry
+            new_round = {
+                'date': pred['date'],
+                'predicted_score': pred['score'],
+                'actual_score': actual_score,
+                **pred['features']
+            }
+            
+            # Append
+            new_rounds = pd.concat([new_rounds, pd.DataFrame([new_round])], ignore_index=True)
+            new_rounds.to_csv(NEW_ROUNDS_FILE, index=False)
+            
+            # Calculate error
+            error = actual_score - pred['score']
+            
+            st.markdown(f"""
+            <div class="prediction-box">
+                <h2>✅ Score Saved!</h2>
+                <table style="margin: 20px auto; font-size: 1.2rem;">
+                    <tr><td><b>Predicted:</b></td><td>{pred['score']:.0f}</td></tr>
+                    <tr><td><b>Actual:</b></td><td>{actual_score}</td></tr>
+                    <tr><td><b>Difference:</b></td><td style="color: {'green' if error < 0 else 'red'};">
+                        {'+' if error > 0 else ''}{error:.0f} strokes</td></tr>
+                </table>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Check if we should retrain
+            num_rounds = len(new_rounds.dropna(subset=['actual_score']))
+            
+            if num_rounds >= 10 and num_rounds % 10 == 0:
+                with st.spinner("🔄 Auto-retraining model..."):
+                    # Combine historical and new data
+                    df_hist = pd.read_csv(HISTORY_FILE)
+                    new_rounds['date'] = pd.to_datetime(new_rounds['date'])
+                    new_rounds['score'] = new_rounds['actual_score']
+                    
+                    combined = pd.concat([df_hist, new_rounds], ignore_index=True)
+                    train_model(combined)
+                    
+                    st.success(f"🎉 Model retrained with {num_rounds} new rounds!")
+                    st.balloons()
+            else:
+                next_retrain = ((num_rounds // 10) + 1) * 10
+                st.info(f"⏳ {next_retrain - num_rounds} more rounds until next auto-retrain!")
+            
+            # Clear prediction
+            del st.session_state['last_prediction']
+
+# TAB 3: Stats
+with tab3:
+    st.markdown("#### 📊 Your Statistics")
+    
+    # Load all data
+    try:
+        df_hist = pd.read_csv(HISTORY_FILE)
+        new_rounds = pd.read_csv(NEW_ROUNDS_FILE)
+        
+        st.metric("Total Rounds", len(df_hist))
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Average Score", f"{df_hist['score'].mean():.1f}")
+        with col2:
+            st.metric("Best Score", int(df_hist['score'].min()))
+        with col3:
+            st.metric("Worst Score", int(df_hist['score'].max()))
+        
+        # New rounds stats
+        valid_new = new_rounds.dropna(subset=['actual_score'])
+        if len(valid_new) > 0:
+            st.markdown("#### 🆕 New Rounds with Predictions")
+            st.metric("Rounds with Predictions", len(valid_new))
+            
+            errors = valid_new['actual_score'] - valid_new['predicted_score']
+            mae = np.abs(errors).mean()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Prediction Accuracy (MAE)", f"{mae:.1f} strokes")
+            with col2:
+                better = (errors < 0).sum()
+                st.metric("Beat Prediction", f"{better}/{len(valid_new)}")
+            
+            # Recent rounds
+            st.markdown("#### 🕐 Last 5 Rounds")
+            recent = df_hist.tail(5)[['date', 'score']].copy()
+            recent['date'] = pd.to_datetime(recent['date']).dt.strftime('%m/%d/%Y')
+            st.dataframe(recent, use_container_width=True, hide_index=True)
+        
+    except Exception as e:
+        st.error(f"Error loading stats: {e}")
+
+# Footer
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #888; font-size: 0.9rem;'>
+    ⛳ Built with love for Dad 💚<br>
+    Made by your data scientist son
+</div>
+""", unsafe_allow_html=True)
