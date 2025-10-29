@@ -1,11 +1,12 @@
 import os
+import re
 import pickle
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error  # (kept if you use later)
+from sklearn.metrics import mean_absolute_error  # if you use it later
 
 # -----------------------
 # Optional OpenAI (lazy)
@@ -18,13 +19,11 @@ def get_openai_client():
     """
     api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
     if not api_key:
-        st.warning("OpenAI key not set; continuing without OpenAI features.")
         return None
     try:
         from openai import OpenAI  # lazy import
         return OpenAI(api_key=api_key)
-    except Exception as e:
-        st.warning(f"OpenAI client not initialized ({type(e).__name__}); continuing without it.")
+    except Exception:
         return None
 
 # -----------------------
@@ -71,6 +70,16 @@ HISTORY_FILE = "golf_history.csv"
 NEW_ROUNDS_FILE = "new_rounds.csv"
 
 # -----------------------
+# Helpers
+# -----------------------
+def parse_partner_names(raw: str):
+    """Return a clean list of partner names from a comma/semicolon/newline-separated string."""
+    if not raw:
+        return []
+    parts = re.split(r"[,\n;]+", raw)
+    return [p.strip() for p in parts if p.strip()]
+
+# -----------------------
 # Data / Model utilities
 # -----------------------
 def train_model(df: pd.DataFrame):
@@ -82,7 +91,7 @@ def train_model(df: pd.DataFrame):
         'difficulty_vs_home', 'pcc',
         'practice_score', 'greens_numeric', 'rough_numeric',
         'has_construction', 'has_standing_water', 'time_numeric',
-        'num_partners', 'physical_condition'
+        'num_partners', 'physical_condition', 'course_condition'  # <- new feature
     ]
     X = df[features]
     y = df['score']
@@ -148,7 +157,7 @@ def initialize_data():
         df['rolling_avg_5'] = df['score'].rolling(window=5, min_periods=1).mean()
         df['rolling_std_5'] = df['score'].rolling(window=5, min_periods=1).std().fillna(0)
 
-        # default qualitative features
+        # qualitative defaults
         df['practice_score'] = 0
         df['greens_numeric'] = 1
         df['rough_numeric'] = 1
@@ -157,16 +166,17 @@ def initialize_data():
         df['time_numeric'] = 0
         df['num_partners'] = 3
         df['physical_condition'] = 7
+        df['course_condition'] = 7  # <- new feature default
 
         df.to_csv(HISTORY_FILE, index=False)
         train_model(df)
 
     # ensure new_rounds file exists with headers we use later
     if not os.path.exists(NEW_ROUNDS_FILE):
-        pd.DataFrame(columns=['date', 'predicted_score', 'actual_score']).to_csv(NEW_ROUNDS_FILE, index=False)
+        pd.DataFrame(columns=['date', 'predicted_score', 'actual_score', 'partner_names']).to_csv(NEW_ROUNDS_FILE, index=False)
 
 def get_weather_forecast():
-    """Very simple seasonal estimate for Naples, FL."""
+    """Very simple seasonal estimate placeholder."""
     month = datetime.now().month
     temp_map = {1: 68, 2: 70, 3: 74, 4: 78, 5: 82, 6: 86, 7: 88, 8: 88, 9: 87, 10: 83, 11: 76, 12: 70}
     temp = temp_map.get(month, 80)
@@ -216,7 +226,8 @@ def make_prediction(inputs: dict):
         'has_standing_water': inputs['has_standing_water'],
         'time_numeric': inputs['time_numeric'],
         'num_partners': inputs['num_partners'],
-        'physical_condition': inputs['physical_condition']
+        'physical_condition': inputs['physical_condition'],
+        'course_condition': inputs['course_condition']  # <- new feature
     }
 
     X = pd.DataFrame([features])
@@ -232,7 +243,7 @@ initialize_data()
 # UI
 # -----------------------
 st.title("⛳ Golf Score Predictor")
-st.markdown("### Predict your score at Naples Lakes")
+st.markdown("### Predict your score")
 
 tab1, tab2, tab3 = st.tabs(["🎯 Predict Score", "📝 Enter Actual Score", "📊 Stats"])
 
@@ -247,10 +258,15 @@ with tab1:
         greens_speed = st.selectbox("Greens Speed", options=["Slow", "Medium", "Fast"], index=1)
         rough_thickness = st.selectbox("Rough Thickness", options=["Thin", "Normal", "Thick"], index=1)
     with col2:
-        physical_condition = st.slider("Physical Condition", 1, 10, 7, help="How do you feel today?")
+        physical_condition = st.slider("Your Physical Condition", 1, 10, 7, help="How do you feel today?")
+        course_condition = st.slider("Course's Condition", 1, 10, 7, help="Overall course quality today")
         time_of_day = st.selectbox("Time of Day", options=["Morning", "Afternoon", "Evening"], index=0)
-        num_partners = st.number_input("Number of Playing Partners", 0, 5, 3)
-        construction = st.checkbox("Construction areas on course?")
+
+    partner_names_raw = st.text_area(
+        "Playing Partners (first name + last initial each, separated by commas/lines)",
+        placeholder="e.g., John D, Maria P, Lee K"
+    )
+    construction = st.checkbox("Construction areas on course?")
     standing_water = st.checkbox("Temporary standing water on course?")
 
     if st.button("🎯 PREDICT MY SCORE", type="primary"):
@@ -258,6 +274,9 @@ with tab1:
         greens_map = {"Slow": 0, "Medium": 1, "Fast": 2}
         rough_map = {"Thin": 0, "Normal": 1, "Thick": 2}
         time_map = {"Morning": 0, "Afternoon": 1, "Evening": 2}
+
+        partner_names = parse_partner_names(partner_names_raw)
+        num_partners = len(partner_names)
 
         inputs = {
             'tee_box': tee_box,
@@ -268,7 +287,9 @@ with tab1:
             'has_standing_water': int(standing_water),
             'time_numeric': time_map[time_of_day],
             'num_partners': int(num_partners),
-            'physical_condition': int(physical_condition)
+            'physical_condition': int(physical_condition),
+            'course_condition': int(course_condition),
+            'partner_names': partner_names,  # store for later
         }
 
         prediction, features, weather = make_prediction(inputs)
@@ -293,7 +314,10 @@ with tab1:
             st.write(f"🌡️ Temperature: {weather['temp_mean']:.0f}°F")
             st.write(f"💨 Wind: {weather['wind_speed_max']:.0f} mph")
             st.write(f"🏌️ Tee Box: {tee_box}")
-            st.write(f"💪 Physical Condition: {physical_condition}/10")
+            st.write(f"💪 Your Physical Condition: {physical_condition}/10")
+            st.write(f"🟢 Course's Condition: {course_condition}/10")
+            if partner_names:
+                st.write("👥 Partners:", ", ".join(partner_names))
 
             st.success("✅ Prediction saved! Enter your actual score after the round in the next tab.")
 
@@ -313,12 +337,16 @@ with tab2:
             try:
                 new_rounds = pd.read_csv(NEW_ROUNDS_FILE)
             except Exception:
-                new_rounds = pd.DataFrame(columns=['date', 'predicted_score', 'actual_score'])
+                new_rounds = pd.DataFrame(columns=['date', 'predicted_score', 'actual_score', 'partner_names'])
+
+            partner_names = pred['inputs'].get('partner_names', [])
+            partner_names_str = ", ".join(partner_names) if partner_names else ""
 
             new_round = {
                 'date': pred['date'],
                 'predicted_score': pred['score'],
                 'actual_score': actual_score,
+                'partner_names': partner_names_str,
                 **pred['features']
             }
 
@@ -376,7 +404,7 @@ with tab3:
         try:
             new_rounds = pd.read_csv(NEW_ROUNDS_FILE)
         except Exception:
-            new_rounds = pd.DataFrame(columns=['date', 'predicted_score', 'actual_score'])
+            new_rounds = pd.DataFrame(columns=['date', 'predicted_score', 'actual_score', 'partner_names'])
 
         if 'actual_score' in new_rounds.columns and len(new_rounds.dropna(subset=['actual_score'])) > 0:
             st.markdown("#### 🆕 New Rounds with Predictions")
